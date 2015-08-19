@@ -16,14 +16,25 @@ function! metarw#gdrive#complete(arglead, cmdline, cursorpos)
   return [[], '', '']
 endfunction
 
+function! s:getpath(fakepath)
+  let _ = s:parse_incomplete_fakepath(a:fakepath)
+  let index = s:read_list(s:parse_incomplete_fakepath("gdrive:/"))
+  for item in index[1]
+    if item["label"] == _.path || item["fakepath"] == _.given_fakepath
+      return s:parse_incomplete_fakepath(item["fakepath"])
+    endif
+  endfor
+  throw "NoSuchFile"
+endfunction
+
 function! metarw#gdrive#read(fakepath)
   let _ = s:parse_incomplete_fakepath(a:fakepath)
   if _.path == '' || _.path =~ '[\/]$'
-    let result = s:read_list(_)
+    return s:read_list(_)
   else
-    let result = s:read_content(_)
+    return s:read_content(s:getpath(a:fakepath))
   endif
-  return result
+  return 
 endfunction
 
 function! metarw#gdrive#write(fakepath, line1, line2, append_p)
@@ -33,7 +44,7 @@ function! metarw#gdrive#write(fakepath, line1, line2, append_p)
     throw 'metarw:gdrive#e1'
   else
     let content = iconv(join(getline(a:line1, a:line2), "\n"), &encoding, 'utf-8')
-    let result = s:write_content(_, content)
+    let result = s:write_content(s:getpath(_.given_fakepath), content)
   endif
   return result
 endfunction
@@ -70,17 +81,31 @@ function! s:read_content(_, ...)
     endif
     return s:read_content(a:_, 1)
   endif
-  if !has_key(res, 'downloadUrl')
-    return ['error', 'This file seems impossible to edit in vim!']
+
+  let b:pandoc_converted = 0
+
+  let tmp = tempname()
+  if has_key(res, 'downloadUrl')
+    let downloadUrl = res.downloadUrl
+    let fileExt = res.fileExtension
+    let resp = webapi#http#get(downloadUrl, '', {'Authorization': 'Bearer ' . s:settings['access_token']})
+    let content = resp.content
+  else
+    let downloadUrl = res.exportLinks["application/vnd.openxmlformats-officedocument.wordprocessingml.document"]
+    let b:pandoc_converted = 1
+    let fileExt = "md"
+    let command = "/usr/bin/curl -s -H 'Authorization: Bearer " . s:settings['access_token'] . "' '" . downloadUrl . "' > " . tmp
+    let content = system(command)
   endif
-  let resp = webapi#http#get(res.downloadUrl, '', {'Authorization': 'Bearer ' . s:settings['access_token']})
-  if resp.status !~ '^2'
-    return ['error', resp.header[0]]
+
+
+  if b:pandoc_converted 
+    let content =  system("pandoc --normalize --columns=80 -f docx " . tmp . " -t markdown_github")
   endif
-  let content = resp.content
+
   call setline(2, split(iconv(content, 'utf-8', &encoding), "\n"))
 
-  let ext = '.' . res.fileExtension
+  let ext = '.' . fileExt
   if has_key(s:extmap, ext)
     let &filetype = s:extmap[ext]
   endif
@@ -92,14 +117,40 @@ function! s:write_content(_, content, ...)
   if !s:load_settings()
     return ['error', v:errmsg]
   endif
-  let id = a:_.id
-  if !has_key(b:, 'metarw_gdrive_id')
-    let title = id
-    let path = split(a:_.path, '[\/]')[0]
-    let res = webapi#json#decode(webapi#http#post('https://www.googleapis.com/drive/v2/files', webapi#json#encode({"title": title, "mimeType": "application/octet-stream", "description": "", "parents": [{"id": path}]}), {'Authorization': 'Bearer ' . s:settings['access_token'], 'Content-Type': 'application/json'}, 'POST').content)
-    let id = res['id']
+  let content = system("pandoc --normalize -s -f markdown_github -t html5", a:content)
+  let contenttype = 'text/html'
+
+  if exists('b:pandoc_converted') && b:pandoc_converted
+    let id = a:_.id
+    if !has_key(b:, 'metarw_gdrive_id')
+      let title = id
+      let path = split(a:_.path, '[\/]')[0]
+      let res = webapi#json#decode(webapi#http#post('https://www.googleapis.com/drive/v2/files', webapi#json#encode({"title": title, "mimeType": "application/octet-stream", "description": "", "parents": [{"id": path}]}), {'Authorization': 'Bearer ' . s:settings['access_token'], 'Content-Type': 'application/json'}, 'POST').content)
+      let id = res['id']
+    endif
+    let tmp = system("tee /tmp/content", content)
+    let res = webapi#json#decode(webapi#http#post('https://www.googleapis.com/upload/drive/v2/files/' . webapi#http#encodeURI(id), content, {'Authorization': 'Bearer ' . s:settings['access_token'], 'Content-Type': contenttype}, 'PUT').content)
+  else
+    " New file
+    let mime_sep = "mime_sep_23781267123649714681462108461481"
+    let meta = webapi#json#encode({"title": a:_.path})
+    let body = "--" . mime_sep
+\      . "\r\n" 
+\      . "Content-type: application/json; charset=UTF-8" 
+\      . "\r\n\r\n" 
+\      . meta
+\      . "\r\n\r\n" 
+\      . "--" . mime_sep 
+\      . "\r\n" 
+\      . "Content-type: " . contenttype 
+\      . "\r\n\r\n" 
+\      . a:content
+\      . "\r\n" 
+\      . "--" . mime_sep . '--' . "\r\n"
+
+    let header = {'Authorization': 'Bearer ' . s:settings['access_token'], 'Content-Type': 'multipart/related; boundary=\"' . mime_sep .'\"'}
+    let res = webapi#json#decode(webapi#http#post('https://www.googleapis.com/upload/drive/v2/files?uploadType=multipart', body, header).content)
   endif
-  let res = webapi#json#decode(webapi#http#post('https://www.googleapis.com/upload/drive/v2/files/' . webapi#http#encodeURI(id), a:content, {'Authorization': 'Bearer ' . s:settings['access_token'], 'Content-Type': 'application/octet-stream'}, 'PUT').content)
   if has_key(res, 'error')
     if res.error.code != 401 || a:0 != 0
       return ['error', res.error.message]
@@ -107,7 +158,7 @@ function! s:write_content(_, content, ...)
     if !s:refresh_token()
       return ['error', v:errmsg]
     endif
-    return s:write_content(a:_, a:content, 1)
+    return s:write_content(a:_, content, 1)
   endif
   return ['done', '']
 endfunction
